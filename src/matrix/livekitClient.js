@@ -18,6 +18,10 @@ class LiveKitClient extends EventEmitter {
   }
 
   async connect(livekitUrl, token) {
+    // Reset stopping flag — critical for reconnects after teardown,
+    // otherwise the retry loop aborts immediately
+    this._stopping = false;
+
     let lk;
     try { lk = require("@livekit/rtc-node"); }
     catch { throw new Error("@livekit/rtc-node not installed."); }
@@ -41,9 +45,11 @@ class LiveKitClient extends EventEmitter {
     this.room.on(lk.RoomEvent.ParticipantConnected, (p) => {
       log.info("Matrix participant joined: " + p.identity);
       this._subscribeAll(p, lk);
+      this.emit("participantJoined", p);
     });
     this.room.on(lk.RoomEvent.ParticipantDisconnected, (p) => {
       log.info("Matrix participant left: " + p.identity);
+      this.emit("participantLeft", p);
     });
     this.room.on(lk.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
       if (track.kind !== lk.TrackKind.KIND_AUDIO) return;

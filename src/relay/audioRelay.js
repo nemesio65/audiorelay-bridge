@@ -13,7 +13,7 @@ class PCMMixer {
     this.name = name; this.onFrame = onFrame;
     this._bufs = new Map(); this._timer = null;
   }
-  /** Start with internal 20ms clock (used for M→D direction) */
+  /** Start with internal 20ms clock (used when an active clock is needed) */
   start() { this._timer = setInterval(() => this._tick(), FRAME_MS); }
   /** Start without internal clock — caller uses pull() instead */
   startPassive() { /* no timer — pull() is called externally */ }
@@ -27,7 +27,7 @@ class PCMMixer {
   }
   /**
    * Pull one mixed frame. Returns a Buffer or null if no audio is buffered.
-   * Used when an external clock drives the output (e.g. LiveKit output loop).
+   * Used when an external clock drives the output (e.g. LiveKit or Discord output loop).
    */
   pull() {
     const contrib = [];
@@ -40,11 +40,10 @@ class PCMMixer {
     return contrib.length === 1 ? contrib[0] : this._mix(contrib);
   }
   _drain(q, n) {
-    n = n - (n % 2); // ensure 16-bit sample alignment — never split a sample
+    n = n - (n % 2); // ensure 16-bit sample alignment
     let got = 0; const parts = [];
     while (q.length && got < n) {
       const c = q[0], take = Math.min(c.length, n - got);
-      // Ensure take is also 16-bit aligned
       const alignedTake = take - (take % 2);
       if (alignedTake <= 0) { q.shift(); continue; }
       parts.push(c.slice(0, alignedTake)); got += alignedTake;
@@ -78,10 +77,11 @@ class AudioRelay {
     // Discord → Matrix mixer (passive — LiveKit output loop pulls from it)
     this._d2mMixer = new PCMMixer("D→M", null);
 
-    // Matrix → Discord mixer (active — its own 20ms clock pushes to Discord)
-    this._m2dMixer = new PCMMixer("M→D", (frame) => {
-      this.discord.sendAudio(frame);
-    });
+    // Matrix → Discord mixer (passive — Discord output loop pulls from it)
+    // Previously this used an active 20ms clock, but that created a second
+    // independent timer that drifted against the Discord output loop's timer,
+    // causing latency to accumulate over ~10 minutes.
+    this._m2dMixer = new PCMMixer("M→D", null);
 
     this._discordHandler = null;
     this._matrixHandler  = null;
@@ -102,11 +102,9 @@ class AudioRelay {
 
     // Matrix audio → Discord (resample if needed)
     this._matrixHandler = ({ userId, pcm, sampleRate, channels }) => {
-      // If already 48kHz stereo, use directly
       if ((!sampleRate || sampleRate === SAMPLE_RATE) && (!channels || channels === CHANNELS)) {
         this._m2dMixer.push(userId, pcm);
       } else {
-        // Resample via ffmpeg
         this._resample(pcm, sampleRate || SAMPLE_RATE, channels || CHANNELS)
           .then((normalized) => this._m2dMixer.push(userId, normalized))
           .catch((err) => log.warn("Resample failed for " + userId + ":", err.message));
@@ -114,50 +112,17 @@ class AudioRelay {
     };
     this.livekit.on("audioPacket", this._matrixHandler);
 
+    // Both mixers are passive — no internal timers
     this._d2mMixer.startPassive();
-    this._m2dMixer.start();
+    this._m2dMixer.startPassive();
 
-    // Tell LiveKit to pull mixed D→M audio directly from the mixer
-    // on its own 20ms output clock — single clock, zero drift
+    // D→M: LiveKit output loop pulls from d2mMixer on its own 20ms clock
     this.livekit.setAudioSource(this._d2mMixer);
 
-    log.info("Audio relay started ✓");
-  }
+    // M→D: Discord output loop pulls from m2dMixer on its own 20ms clock
+    this.discord.setAudioSource(this._m2dMixer);
 
-  /**
-   * Normalise a PCM buffer to 48kHz stereo 16-bit synchronously.
-   * Handles mono→stereo upmix and sample rate differences.
-   * For already-correct format, returns the buffer directly (zero copy).
-   */
-  _normalise(pcm, srcRate, srcChannels) {
-    // Fast path: already stereo 48kHz
-    if (srcRate === SAMPLE_RATE && srcChannels === CHANNELS) return pcm;
-
-    // Mono → stereo upmix (synchronous, no subprocess needed)
-    if (srcRate === SAMPLE_RATE && srcChannels === 1) {
-      const samples = pcm.length / 2; // number of mono samples
-      const out = Buffer.alloc(samples * 4); // stereo = 2x samples * 2 bytes
-      for (let i = 0; i < samples; i++) {
-        const val = pcm.readInt16LE(i * 2);
-        out.writeInt16LE(val, i * 4);     // left
-        out.writeInt16LE(val, i * 4 + 2); // right (duplicate)
-      }
-      return out;
-    }
-
-    // Different sample rate — use async FFmpeg (queued, not blocking)
-    this._resample(pcm, srcRate, srcChannels)
-      .then((out) => {
-        // Re-normalise in case FFmpeg output is still mono
-        const final = (srcChannels === 1)
-          ? this._normalise(out, SAMPLE_RATE, 1)
-          : out;
-        // Push directly — bypasses this._normalise to avoid recursion
-        if (final) this._m2dMixer.push("__resampled__", final);
-      })
-      .catch((err) => log.warn("Resample error:", err.message));
-
-    return null; // async path handles it
+    log.info("Audio relay started ✓ (single-clock per direction, zero drift)");
   }
 
   _resample(input, srcRate, srcChannels) {

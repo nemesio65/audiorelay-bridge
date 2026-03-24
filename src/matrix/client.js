@@ -5,13 +5,12 @@
  * ------------
  * Lightweight Matrix HTTP client. No SDK dependency.
  *
- * Key responsibilities for the persistent bridge:
- *  - Join the configured room on startup
- *  - Run the /sync loop
- *  - Detect active Element Call sessions (MSC4143 / MatrixRTC)
- *  - Fetch LiveKit tokens from the homeserver (for hosted Element Call)
- *  - Emit "callStarted" and "callEnded" events
- *  - Wait indefinitely for a call to appear if none is active
+ * Token strategy:
+ *   1. (Preferred) OpenID token → lk-jwt-service at the livekit_service_url
+ *      The auth service derives the correct opaque LiveKit room name from the
+ *      Matrix room ID, eliminating any room-matching guesswork.
+ *   2. (Fallback) Self-sign JWT with LIVEKIT_API_KEY/SECRET — only works if
+ *      the LiveKit room name matches the Matrix room ID (pre-ESS v2.3.0).
  */
 
 const https        = require("https");
@@ -32,6 +31,9 @@ class MatrixClient extends EventEmitter {
     this.syncToken   = null;
     this._stopping   = false;
     this._syncActive = false;
+
+    this._activeMembers = new Map();
+    this._callActive = false;
   }
 
   // ─── HTTP ────────────────────────────────────────────────────────────────
@@ -77,6 +79,46 @@ class MatrixClient extends EventEmitter {
     });
   }
 
+  /**
+   * Generic HTTP request to an EXTERNAL URL (not the homeserver).
+   * Used for lk-jwt-service requests.
+   */
+  _externalRequest(method, urlStr, body = null) {
+    return new Promise((resolve, reject) => {
+      const url     = new URL(urlStr);
+      const isHttps = url.protocol === "https:";
+      const lib     = isHttps ? https : http;
+
+      const options = {
+        hostname: url.hostname,
+        port:     url.port || (isHttps ? 443 : 80),
+        path:     url.pathname + url.search,
+        method,
+        headers: { "Content-Type": "application/json" },
+      };
+
+      const req = lib.request(options, (res) => {
+        let raw = "";
+        res.on("data", (d) => (raw += d));
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(raw);
+            if (res.statusCode >= 400) {
+              return reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(json)}`));
+            }
+            resolve(json);
+          } catch {
+            reject(new Error(`Non-JSON response from ${urlStr}: ${raw.slice(0, 200)}`));
+          }
+        });
+      });
+
+      req.on("error", reject);
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
+  }
+
   _get(path)        { return this._request("GET",  path); }
   _post(path, body) { return this._request("POST", path, body); }
   _put(path, body)  { return this._request("PUT",  path, body); }
@@ -89,7 +131,6 @@ class MatrixClient extends EventEmitter {
       await this._post(`/_matrix/client/v3/join/${encodeURIComponent(this.roomId)}`);
       log.info("✓ Joined Matrix room");
     } catch (err) {
-      // 403 = already joined or no permission; 200 = joined; ignore "already in room"
       if (err.statusCode === 403) {
         log.warn("Could not join room (forbidden) — bot may already be a member or lacks invite");
       } else {
@@ -104,56 +145,99 @@ class MatrixClient extends EventEmitter {
     return this._put(path, { msgtype: "m.text", body: text });
   }
 
+  // ─── OpenID token ────────────────────────────────────────────────────────
+
+  /**
+   * Get an OpenID token from the homeserver for the bot user.
+   * Used to authenticate with the lk-jwt-service.
+   */
+  async _getOpenIDToken() {
+    const path = `/_matrix/client/v3/user/${encodeURIComponent(this.userId)}/openid/request_token`;
+    const resp = await this._post(path, {});
+    log.debug(`Got OpenID token (expires in ${resp.expires_in}s)`);
+    return resp; // { access_token, token_type, matrix_server_name, expires_in }
+  }
+
   // ─── LiveKit token ───────────────────────────────────────────────────────
 
   /**
    * Get a LiveKit JWT for the bridge bot to join a call.
    *
    * Strategy:
-   *   1. If LIVEKIT_API_KEY + LIVEKIT_API_SECRET are set → self-sign a token
-   *   2. Otherwise → ask the Matrix homeserver for one via the openid/call endpoint
+   *   1. (Preferred) Use OpenID token → lk-jwt-service at livekitUrl/sfu/get
+   *      This lets the auth service derive the correct opaque LiveKit room name.
+   *      No LIVEKIT_API_KEY/SECRET needed.
+   *
+   *   2. (Fallback) Self-sign with LIVEKIT_API_KEY/SECRET if set and
+   *      lk-jwt-service fails. Only works if room names match Matrix room IDs.
+   *
+   * @returns {{ token: string, url: string }}
    */
   async getLiveKitToken(livekitUrl, callId, deviceId) {
-    // Normalise URL: convert https:// → wss://, http:// → ws://
-    livekitUrl = livekitUrl
-      .replace(/^https:\/\//, "wss://")
-      .replace(/^http:\/\//, "ws://");
+    if (!deviceId) throw new Error("deviceId is required for getLiveKitToken");
 
-    if (!config.livekit.apiKey || !config.livekit.apiSecret) {
-      throw new Error("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set in .env");
+    // Normalise URL to https for the auth service endpoint
+    const httpUrl = livekitUrl
+      .replace(/^wss:\/\//, "https://")
+      .replace(/^ws:\/\//, "http://");
+
+    // ── Strategy 1: OpenID → lk-jwt-service ─────────────────────────────
+    try {
+      const openIdToken = await this._getOpenIDToken();
+
+      // The legacy /sfu/get endpoint format
+      const reqBody = {
+        room:         callId,
+        openid_token: openIdToken,
+        device_id:    deviceId,
+      };
+
+      log.info(`Requesting LiveKit token from ${httpUrl}/sfu/get for room ${callId}`);
+      const resp = await this._externalRequest("POST", `${httpUrl}/sfu/get`, reqBody);
+
+      if (resp.jwt && resp.url) {
+        log.info(`✓ Got LiveKit token from auth service — url: ${resp.url}`);
+        return { token: resp.jwt, url: resp.url };
+      }
+
+      log.warn("lk-jwt-service response missing jwt/url fields:", JSON.stringify(resp));
+    } catch (err) {
+      log.warn(`lk-jwt-service failed: ${err.message}`);
     }
 
-    const { AccessToken } = require("livekit-server-sdk");
+    // ── Strategy 2: Self-sign fallback ──────────────────────────────────
+    if (config.livekit.apiKey && config.livekit.apiSecret) {
+      log.info("Falling back to self-signed LiveKit token");
+      const { AccessToken } = require("livekit-server-sdk");
 
-    // Use the provided deviceId so token identity matches membership state event
-    // Identity format: @user:server:deviceId — confirmed from auth service logs
-    if (!deviceId) throw new Error("deviceId is required for getLiveKitToken");
-    const identity = `${this.userId}:${deviceId}`;
+      const wsUrl = livekitUrl
+        .replace(/^https:\/\//, "wss://")
+        .replace(/^http:\/\//, "ws://");
 
-    const at = new AccessToken(config.livekit.apiKey, config.livekit.apiSecret, {
-      identity,
-      name: "Voice Bridge",
-      ttl:  7200, // 2 hours in seconds — prevents TimeoutNegativeWarning
-    });
+      const identity = `${this.userId}:${deviceId}`;
+      const at = new AccessToken(config.livekit.apiKey, config.livekit.apiSecret, {
+        identity,
+        name: "Voice Bridge",
+        ttl:  7200,
+      });
 
-    at.addGrant({
-      roomJoin:     true,
-      room:         callId,   // use the alias directly — e.g. !KfcOTI...:bhsnw.com
-      canPublish:   true,
-      canSubscribe: true,
-    });
+      at.addGrant({
+        roomJoin: true,
+        room: callId,
+        canPublish: true,
+        canSubscribe: true,
+      });
 
-    const token = await at.toJwt();
-    log.info(`Generated LiveKit token — room: "${callId}", identity: "${identity}"`);
-    return { token, url: livekitUrl };
+      const token = await at.toJwt();
+      log.info(`Self-signed LiveKit token — room: "${callId}", identity: "${identity}"`);
+      return { token, url: wsUrl };
+    }
+
+    throw new Error("Could not obtain LiveKit token: lk-jwt-service failed and no LIVEKIT_API_KEY/SECRET configured");
   }
 
   // ─── Call detection ──────────────────────────────────────────────────────
 
-  /**
-   * Scan current room state for an active Element Call session.
-   * Returns { callId, livekitUrl } or null.
-   */
   async getActiveCall() {
     try {
       const state = await this._get(
@@ -173,13 +257,7 @@ class MatrixClient extends EventEmitter {
     }
   }
 
-  /**
-   * Wait for an Element Call to appear in the room.
-   * If timeoutMs is 0, waits forever.
-   * Resolves with { callId, livekitUrl }.
-   */
   async waitForCall(timeoutMs = 0) {
-    // First check if one is already active
     const existing = await this.getActiveCall();
     if (existing) {
       log.info(`Found existing call: ${existing.callId}`);
@@ -194,19 +272,16 @@ class MatrixClient extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       let timer = null;
-
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           this.removeListener("callStarted", handler);
           reject(new Error("Timed out waiting for Element Call"));
         }, timeoutMs);
       }
-
       const handler = (callInfo) => {
         if (timer) clearTimeout(timer);
         resolve(callInfo);
       };
-
       this.once("callStarted", handler);
     });
   }
@@ -220,58 +295,36 @@ class MatrixClient extends EventEmitter {
     return null;
   }
 
-  /**
-   * Parse a call member event in either known format:
-   *
-   * Format A — old "memberships array" style:
-   *   content.memberships = [{ application, call_id, foci_active: [{type:"livekit", livekit_service_url}] }]
-   *
-   * Format B — new flat MSC4143 style (used by bhsnw.com / Element Call):
-   *   content = { application:"m.call", call_id:"", foci_preferred: [{type:"livekit", livekit_service_url, livekit_alias}] }
-   *
-   * Returns { callId, livekitUrl } or null.
-   */
   _parseCallEvent(event) {
     const c = event.content;
     if (!c || !Object.keys(c).length) return null;
 
-    // ── Format B: flat MSC4143 (ESS / modern Element Call) ────────────────
     if (c.application === "m.call") {
-      // Try foci_preferred first (array of focus objects), then foci_active
-      // ESS uses foci_preferred for the list and focus_active (singular) for selection
       const fociList = Array.isArray(c.foci_preferred) ? c.foci_preferred
                      : Array.isArray(c.foci_active)    ? c.foci_active
                      : [];
-
       const lk = fociList.find((f) => f.type === "livekit" && f.livekit_service_url);
-
       if (lk) {
         const callId     = c.call_id || lk.livekit_alias || this.roomId;
         const livekitUrl = lk.livekit_service_url;
         log.debug(`_parseCallEvent: callId="${callId}" livekitUrl="${livekitUrl}"`);
         return { callId, livekitUrl };
       }
-
-      // ESS edge case: focus_active is an object (not array) with livekit_service_url
       if (c.focus_active?.type === "livekit" && c.focus_active?.livekit_service_url) {
         const callId     = c.call_id || this.roomId;
         const livekitUrl = c.focus_active.livekit_service_url;
         log.debug(`_parseCallEvent (focus_active): callId="${callId}" livekitUrl="${livekitUrl}"`);
         return { callId, livekitUrl };
       }
-
-      log.debug(`_parseCallEvent: m.call event but no livekit focus found. foci_preferred=${JSON.stringify(c.foci_preferred)}`);
+      log.debug(`_parseCallEvent: m.call event but no livekit focus found`);
     }
 
-    // ── Format A: memberships array (older homeservers) ────────────────────
     const memberships = c.memberships ?? [];
     const active = memberships.find((m) => m.application === "m.call");
     if (!active) return null;
-
     const foci = active.foci_active ?? active.foci_preferred ?? [];
     const lk   = foci.find((f) => f.type === "livekit" && f.livekit_service_url);
     if (!lk) return null;
-
     return {
       callId:     active.call_id || lk.livekit_alias || this.roomId,
       livekitUrl: lk.livekit_service_url,
@@ -284,7 +337,7 @@ class MatrixClient extends EventEmitter {
     if (this._syncActive) return;
     this._syncActive  = true;
     this._stopping    = false;
-    this._initialSync = true; // first response is a full state snapshot
+    this._initialSync = true;
     log.info("Matrix sync loop started");
     this._syncLoop().catch((err) => log.error("Sync loop fatal:", err.message));
   }
@@ -304,7 +357,6 @@ class MatrixClient extends EventEmitter {
         } else {
           qs.set("full_state", "true");
         }
-
         const resp = await this._get(`/_matrix/client/v3/sync?${qs}`);
         this.syncToken = resp.next_batch;
         this._processSyncResponse(resp);
@@ -321,18 +373,20 @@ class MatrixClient extends EventEmitter {
     const joined = resp.rooms?.join ?? {};
 
     for (const [roomId, data] of Object.entries(joined)) {
-      if (roomId !== this.roomId) continue;
-
-      const events = [
+      const allEvents = [
         ...(data.timeline?.events ?? []),
         ...(data.state?.events   ?? []),
       ];
+      const callEventsInRoom = allEvents.filter(e => e.type === "org.matrix.msc3401.call.member");
+      if (callEventsInRoom.length > 0 && roomId !== this.roomId) {
+        log.debug(`Sync: ignoring ${callEventsInRoom.length} call event(s) from room ${roomId} (watching ${this.roomId})`);
+      }
+
+      if (roomId !== this.roomId) continue;
+
+      const events = allEvents;
 
       if (this._initialSync) {
-        // On the first sync we get a full state snapshot — it contains ALL
-        // historical call member events including stale ones. Instead of
-        // replaying every start/end/start/end, find the current net state
-        // by looking at the LATEST call member event per state_key.
         this._initialSync = false;
         const latestByKey = new Map();
         for (const event of events) {
@@ -340,20 +394,30 @@ class MatrixClient extends EventEmitter {
             latestByKey.set(event.state_key ?? "", event);
           }
         }
-        // Emit a single callStarted if ANY latest event is an active call
+        for (const [stateKey, event] of latestByKey) {
+          if (stateKey.includes(this.userId)) continue;
+          const info = this._parseCallEvent(event);
+          if (info) {
+            const displayName = this._extractDisplayName(stateKey);
+            this._activeMembers.set(stateKey, displayName);
+          }
+        }
+        if (this._activeMembers.size > 0) {
+          log.info(`Initial sync: ${this._activeMembers.size} active call member(s)`);
+        }
         for (const event of latestByKey.values()) {
           const info = this._parseCallEvent(event);
           if (info) {
             log.info(`Initial sync: active call found → ${info.callId}`);
+            this._callActive = true;
             this.emit("callStarted", info);
-            return; // found one, done
+            return;
           }
         }
         log.info("Initial sync: no active call in room");
         return;
       }
 
-      // Normal incremental sync — process events in order
       for (const event of events) {
         this._checkCallEvent(event);
       }
@@ -364,23 +428,26 @@ class MatrixClient extends EventEmitter {
     if (event.type !== "org.matrix.msc3401.call.member") return;
 
     const c = event.content;
-    const isOurEvent = event.state_key?.includes(this.userId);
+    const stateKey = event.state_key ?? "";
+    const isOurEvent = stateKey.includes(this.userId);
 
-    // If this is our own bot's state key changing, ignore it entirely —
-    // we manage our own state; don't let it trigger callEnded/callStarted loops
     if (isOurEvent) {
-      log.debug(`Ignoring own call membership event (state_key: ${event.state_key})`);
+      log.debug(`Ignoring own call membership event (state_key: ${stateKey})`);
       return;
     }
 
-    // Empty content = this participant left
     const isEmpty = !c || !Object.keys(c).length ||
                     (Array.isArray(c.memberships) && c.memberships.length === 0);
 
+    const displayName = this._extractDisplayName(stateKey);
+
     if (isEmpty) {
-      // Only emit callEnded if there are no other active (non-bot) participants
-      // We check by querying current room state via getActiveCall()
-      log.debug(`Participant left (state_key: ${event.state_key}) — checking if call is truly over`);
+      if (this._activeMembers.has(stateKey)) {
+        this._activeMembers.delete(stateKey);
+        log.info(`Call member left: ${displayName}`);
+        this.emit("callMemberLeft", { stateKey, displayName });
+      }
+      log.debug(`Participant left (state_key: ${stateKey}) — checking if call is truly over`);
       this._checkIfCallOver();
       return;
     }
@@ -388,27 +455,71 @@ class MatrixClient extends EventEmitter {
     const callInfo = this._parseCallEvent(event);
     if (!callInfo) return;
 
-    log.info(`Element Call detected: callId="${callInfo.callId}" url="${callInfo.livekitUrl}"`);
-    this.emit("callStarted", callInfo);
+    if (!this._activeMembers.has(stateKey)) {
+      this._activeMembers.set(stateKey, displayName);
+      log.info(`Call member joined: ${displayName}`);
+      this.emit("callMemberJoined", { stateKey, displayName, callInfo });
+    }
+
+    if (!this._callActive) {
+      this._callActive = true;
+      log.info(`Element Call detected: callId="${callInfo.callId}" url="${callInfo.livekitUrl}"`);
+      this.emit("callStarted", callInfo);
+    } else {
+      log.debug(`Call already active — ignoring duplicate callStarted for ${callInfo.callId}`);
+    }
+  }
+
+  _extractDisplayName(stateKey) {
+    const match = stateKey.match(/@([^:]+):/);
+    return match ? match[1] : stateKey;
+  }
+
+  getActiveMembers() {
+    return new Map(this._activeMembers);
+  }
+
+  /**
+   * Check if there are real (non-bot) participants in the call.
+   * Queries current room state to get an accurate count.
+   * @returns {Promise<number>} Number of active non-bot call members
+   */
+  async countActiveParticipants() {
+    try {
+      const state = await this._get(
+        `/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/state`
+      );
+      const active = state.filter(e => {
+        if (e.type !== "org.matrix.msc3401.call.member") return false;
+        if (e.state_key?.includes(this.userId)) return false; // skip our own bot
+        if (!e.content || !Object.keys(e.content).length) return false;
+        return this._parseCallEvent(e) !== null;
+      });
+      return active.length;
+    } catch (err) {
+      log.warn("Could not count active participants:", err.message);
+      // Fall back to in-memory tracking
+      return this._activeMembers.size;
+    }
   }
 
   async _checkIfCallOver() {
-    // Wait a short moment for any in-flight state updates to settle
     await new Promise(r => setTimeout(r, 1000));
     try {
       const state = await this._get(
         `/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/state`
       );
-      // Look for any active call member that is NOT our own bot
       const activeOthers = state.filter(e => {
         if (e.type !== "org.matrix.msc3401.call.member") return false;
-        if (e.state_key?.includes(this.userId)) return false; // skip our own
-        if (!e.content || !Object.keys(e.content).length) return false; // skip empty
-        return this._parseCallEvent(e) !== null; // must be a valid call event
+        if (e.state_key?.includes(this.userId)) return false;
+        if (!e.content || !Object.keys(e.content).length) return false;
+        return this._parseCallEvent(e) !== null;
       });
 
       if (activeOthers.length === 0) {
         log.info("Element Call ended — no active participants remaining");
+        this._activeMembers.clear();
+        this._callActive = false;
         this.emit("callEnded");
       } else {
         log.debug(`Call still active — ${activeOthers.length} other participant(s) present`);
@@ -417,10 +528,7 @@ class MatrixClient extends EventEmitter {
       log.warn("Could not check call state:", err.message);
     }
   }
-  /**
-   * Clean up all stale call membership state events left by previous bridge runs.
-   * Finds all state keys matching our bot's pattern and empties them.
-   */
+
   async cleanupStaleCallMemberships() {
     try {
       const state = await this._get(
@@ -429,12 +537,9 @@ class MatrixClient extends EventEmitter {
       const stale = state.filter(e =>
         e.type === "org.matrix.msc3401.call.member" &&
         e.state_key.startsWith(`_${this.userId}_`) &&
-        Object.keys(e.content || {}).length > 0 // has content = not yet cleaned
+        Object.keys(e.content || {}).length > 0
       );
-      if (stale.length === 0) {
-        log.debug("No stale call memberships to clean up");
-        return;
-      }
+      if (stale.length === 0) { log.debug("No stale call memberships to clean up"); return; }
       log.info(`Cleaning up ${stale.length} stale call membership(s)...`);
       for (const e of stale) {
         const path = `/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/state/org.matrix.msc3401.call.member/${encodeURIComponent(e.state_key)}`;
@@ -446,11 +551,6 @@ class MatrixClient extends EventEmitter {
     }
   }
 
-  /**
-   * Publish a MatrixRTC membership state event so the bridge bot
-   * appears as a visible participant in Element Call.
-   * Must be called after connecting to LiveKit.
-   */
   async publishCallMembership(callId, livekitUrl, deviceId) {
     const stateKey = `_${this.userId}_${deviceId}_m.call`;
     const content = {
@@ -458,7 +558,7 @@ class MatrixClient extends EventEmitter {
       call_id:      callId === this.roomId ? "" : callId,
       scope:        "m.room",
       device_id:    deviceId,
-              expires_ts:   Date.now() + 7200000,
+      expires_ts:   Date.now() + 7200000,
       focus_active: { type: "livekit", focus_selection: "oldest_membership" },
       foci_preferred: [{
         livekit_service_url: livekitUrl.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://"),
@@ -468,7 +568,6 @@ class MatrixClient extends EventEmitter {
       "m.call.intent": "audio",
       created_ts:    Date.now(),
     };
-
     const path = `/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/state/org.matrix.msc3401.call.member/${encodeURIComponent(stateKey)}`;
     try {
       await this._put(path, content);
@@ -478,20 +577,16 @@ class MatrixClient extends EventEmitter {
     }
   }
 
-  /**
-   * Remove the bridge bot's membership state event when leaving a call.
-   */
   async removeCallMembership(deviceId) {
     const stateKey = `_${this.userId}_${deviceId}_m.call`;
     const path = `/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/state/org.matrix.msc3401.call.member/${encodeURIComponent(stateKey)}`;
     try {
-      await this._put(path, {}); // empty content = leave
+      await this._put(path, {});
       log.info("Removed call membership state");
     } catch (err) {
       log.warn("Could not remove call membership:", err.message);
     }
   }
-
 }
 
 module.exports = MatrixClient;

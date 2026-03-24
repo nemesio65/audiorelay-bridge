@@ -1,50 +1,37 @@
 "use strict";
-
 require("dotenv").config();
-
-const PersistentDiscordClient     = require("./discord/persistentClient");
-const { PersistentBridge }        = require("./relay/persistentBridge");
-const { startStatusServer }       = require("./statusServer");
-const { createLogger }            = require("./utils/logger");
-
-const log = createLogger("Main");
-
-async function main() {
-  // Config is validated on require — throws early on missing vars
-  require("../config");
-
-  const discord = new PersistentDiscordClient();
-  const bridge  = new PersistentBridge(discord);
-
-  // HTTP status endpoint
-  const httpServer = startStatusServer(bridge);
-
-  // Graceful shutdown
-  const shutdown = async (signal) => {
-    log.info(`\n${signal} received — shutting down...`);
-    try {
-      await bridge.stop();
-      httpServer.close();
-      log.info("Goodbye.");
-      process.exit(0);
-    } catch (err) {
-      log.error("Error during shutdown:", err.message);
-      process.exit(1);
-    }
-  };
-
-  process.on("SIGINT",  () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("unhandledRejection", (r) => log.error("Unhandled rejection:", r));
-
-  try {
-    // Bridge handles everything: Matrix sync, Discord voice, call loop
-    await bridge.start();
-  } catch (err) {
-    log.error("Fatal error:", err.message);
-    log.error(err.stack);
-    process.exit(1);
-  }
+function required(name) {
+  const val = process.env[name];
+  if (!val) throw new Error(`Missing required env var: ${name}`);
+  return val;
 }
-
-main();
+function optional(name, fallback = "") { return process.env[name] ?? fallback; }
+function optionalInt(name, fallback) { const v = process.env[name]; return v ? parseInt(v, 10) : fallback; }
+module.exports = {
+  discord: {
+    token:         required("DISCORD_BOT_TOKEN"),
+    clientId:      required("DISCORD_CLIENT_ID"),
+    guildId:       required("DISCORD_GUILD_ID"),
+    channelId:     required("DISCORD_CHANNEL_ID"),
+    // Optional: separate text channel for announcements.
+    // If not set, announcements go to the voice channel's built-in text chat.
+    textChannelId: optional("DISCORD_TEXT_CHANNEL_ID"),
+  },
+  matrix: {
+    homeserverUrl: required("MATRIX_HOMESERVER_URL"),
+    botUserId:     required("MATRIX_BOT_USER_ID"),
+    accessToken:   required("MATRIX_BOT_ACCESS_TOKEN"),
+    roomId:        required("MATRIX_ROOM_ID"),
+  },
+  livekit: {
+    apiKey:    optional("LIVEKIT_API_KEY"),
+    apiSecret: optional("LIVEKIT_API_SECRET"),
+  },
+  reconnect: {
+    delayMs:     optionalInt("RECONNECT_DELAY_MS",     5000),
+    maxAttempts: optionalInt("MAX_RECONNECT_ATTEMPTS", 0),
+    callWaitMs:  optionalInt("CALL_WAIT_TIMEOUT_MS",   0),
+  },
+  logLevel: optional("LOG_LEVEL", "info"),
+  httpPort:  optionalInt("HTTP_PORT", 3000),
+};

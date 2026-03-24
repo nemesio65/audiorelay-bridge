@@ -9,10 +9,13 @@ function optional(name, fallback = "") { return process.env[name] ?? fallback; }
 function optionalInt(name, fallback) { const v = process.env[name]; return v ? parseInt(v, 10) : fallback; }
 module.exports = {
   discord: {
-    token:     required("DISCORD_BOT_TOKEN"),
-    clientId:  required("DISCORD_CLIENT_ID"),
-    guildId:   required("DISCORD_GUILD_ID"),
-    channelId: required("DISCORD_CHANNEL_ID"),
+    token:         required("DISCORD_BOT_TOKEN"),
+    clientId:      required("DISCORD_CLIENT_ID"),
+    guildId:       required("DISCORD_GUILD_ID"),
+    channelId:     required("DISCORD_CHANNEL_ID"),
+    // Optional: separate text channel for announcements.
+    // If not set, announcements go to the voice channel's built-in text chat.
+    textChannelId: optional("DISCORD_TEXT_CHANNEL_ID"),
   },
   matrix: {
     homeserverUrl: required("MATRIX_HOMESERVER_URL"),
