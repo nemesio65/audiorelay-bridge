@@ -1,3 +1,8 @@
+
+#THIS IS SLOP GENERATED! 
+there is physical review happening but not enough and not confidently skilled enough to be trusted without your own due diligence 
+---
+
 # Persistent Matrix ↔ Discord Voice Bridge
 
 A single always-on bot that permanently occupies one Discord voice channel and one Matrix/Element Call room, relaying audio between them indefinitely. No slash commands needed — just configure it and run it.
