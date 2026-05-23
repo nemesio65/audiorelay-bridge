@@ -15,25 +15,31 @@ class LiveKitClient extends EventEmitter {
     this._lk         = null;
     this.isReady     = false;
     this._stopping   = false;
+    this._connectGen = 0; // incremented on each connect() call to invalidate stale retry loops
   }
 
   async connect(livekitUrl, token) {
-    // Reset stopping flag — critical for reconnects after teardown,
-    // otherwise the retry loop aborts immediately
+    // Reset stopping flag and bump generation so any stale retry loop self-cancels
     this._stopping = false;
+    const myGen = ++this._connectGen;
 
     let lk;
     try { lk = require("@livekit/rtc-node"); }
     catch { throw new Error("@livekit/rtc-node not installed."); }
     this._lk = lk;
+
     await retryWithBackoff(
-      () => this._connect(lk, livekitUrl, token),
+      () => {
+        // If a newer connect() call has started, or disconnect() was called, abort this loop
+        if (myGen !== this._connectGen) throw Object.assign(new Error("Superseded by newer connect"), { superseded: true });
+        return this._connect(lk, livekitUrl, token);
+      },
       {
         name:   "LiveKit connect",
         baseMs: 5000,
-        maxMs:  15000, // cap backoff at 15s — don't wait too long for room to appear
+        maxMs:  15000,
         max:    0,
-        signal: () => this._stopping,
+        signal: () => this._stopping || myGen !== this._connectGen,
       }
     );
   }
@@ -45,11 +51,9 @@ class LiveKitClient extends EventEmitter {
     this.room.on(lk.RoomEvent.ParticipantConnected, (p) => {
       log.info("Matrix participant joined: " + p.identity);
       this._subscribeAll(p, lk);
-      this.emit("participantJoined", p);
     });
     this.room.on(lk.RoomEvent.ParticipantDisconnected, (p) => {
       log.info("Matrix participant left: " + p.identity);
-      this.emit("participantLeft", p);
     });
     this.room.on(lk.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
       if (track.kind !== lk.TrackKind.KIND_AUDIO) return;
@@ -63,7 +67,6 @@ class LiveKitClient extends EventEmitter {
         for await (const frame of stream) {
           _frameCount++;
           if (_frameCount === 1) {
-            // frame.channels is the correct property in @livekit/rtc-node v0.9.x
             log.info(`LiveKit audio: ${frame.sampleRate}Hz ${frame.channels}ch ${frame.samplesPerChannel} samples/frame (${frame.data.byteLength} bytes) from ${participant.identity}`);
           }
           const pcm = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
@@ -71,7 +74,7 @@ class LiveKitClient extends EventEmitter {
             userId:     participant.identity,
             pcm,
             sampleRate: frame.sampleRate,
-            channels:   frame.channels,   // ← correct property name
+            channels:   frame.channels,
           });
         }
       })().catch((err) => { if (!this._stopping) log.warn("AudioStream error:", err.message); });
@@ -91,20 +94,15 @@ class LiveKitClient extends EventEmitter {
     this._audioSrc   = new lk.AudioSource(48000, 2);
     this._audioTrack = lk.LocalAudioTrack.createAudioTrack("discord-relay", this._audioSrc);
     const pubOptions = new lk.TrackPublishOptions();
-    // Element Call requires MICROPHONE source to display the participant correctly
     if (lk.TrackSource) {
       try { pubOptions.source = lk.TrackSource.SOURCE_MICROPHONE; } catch {}
     }
     await this.room.localParticipant.publishTrack(this._audioTrack, pubOptions);
     log.info("Published audio track — waiting for output loop to confirm frames flow");
 
-    // Note: setMetadata not available in @livekit/rtc-node v0.9.x
-
     this.isReady = true;
     log.info("✓ Connected to LiveKit room and published audio track");
 
-    // Single clock-driven output loop: sends real audio when available,
-    // silence when not. Keeps the track alive for Element Call.
     this._startOutputLoop();
 
     this.emit("ready");
@@ -135,12 +133,9 @@ class LiveKitClient extends EventEmitter {
       }
       this._outputBusy = true;
       try {
-        // Pull mixed audio directly from the relay mixer (if attached)
         const pcmBuffer = this._audioMixer ? this._audioMixer.pull() : null;
 
         if (pcmBuffer) {
-          // Copy into a properly aligned Int16Array to avoid byteOffset alignment issues
-          // Buffer.concat can return buffers with odd byteOffset which corrupts Int16Array views
           const samples = new Int16Array(pcmBuffer.length / 2);
           for (let i = 0; i < samples.length; i++) {
             samples[i] = pcmBuffer.readInt16LE(i * 2);
@@ -148,9 +143,8 @@ class LiveKitClient extends EventEmitter {
           const frame = new this._lk.AudioFrame(samples, 48000, 2, samples.length / 2);
           await this._audioSrc.captureFrame(frame);
           this._framesSent++;
-          this._silenceCount = 0; // reset so we can track silence gaps
+          this._silenceCount = 0;
         } else {
-          // No real audio — send silence to keep track alive
           const frame = new this._lk.AudioFrame(silence, 48000, 2, FRAME_SAMPLES);
           await this._audioSrc.captureFrame(frame);
           this._silenceCount++;
@@ -158,7 +152,6 @@ class LiveKitClient extends EventEmitter {
           if (this._silenceCount === 50) log.info("✓ 50 silence frames sent — track is live");
         }
 
-        // Periodic stats (every 10s) to diagnose quality issues
         const now = Date.now();
         if (now - this._lastStatLog > 10000) {
           if (this._framesSent > 0 || this._skipCount > 0) {
@@ -184,22 +177,13 @@ class LiveKitClient extends EventEmitter {
     }
   }
 
-  /**
-   * Attach a PCMMixer as the audio source. The output loop will call
-   * mixer.pull() each tick instead of using an internal queue.
-   */
   setAudioSource(mixer) {
     this._audioMixer = mixer;
     log.debug("Audio source attached — pulling from mixer");
   }
 
-  /**
-   * Legacy queue-based sendAudio (unused when mixer is attached, but kept
-   * as fallback for direct frame injection if needed).
-   */
   sendAudio(pcmBuffer) {
     if (!this._audioSrc || !this.isReady) return;
-    // If mixer is attached, this shouldn't be called — log a warning
     if (this._audioMixer) {
       log.warn("sendAudio called while mixer is attached — ignoring");
       return;
@@ -208,6 +192,7 @@ class LiveKitClient extends EventEmitter {
 
   async disconnect() {
     this._stopping = true;
+    this._connectGen++; // invalidate any in-flight retry loop immediately
     this.isReady   = false;
     this._audioMixer = null;
     if (this._outputTimer) { clearInterval(this._outputTimer); this._outputTimer = null; }
