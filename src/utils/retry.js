@@ -38,6 +38,12 @@ async function retryWithBackoff(fn, opts = {}) {
       await fn(attempt);
       return; // success
     } catch (err) {
+      // If the error was caused by a superseded/aborted connect, exit cleanly
+      if (err.superseded) {
+        log.info(`${name}: superseded — stopping retry loop`);
+        return;
+      }
+
       const isLast = max > 0 && attempt >= max;
 
       if (isLast) {
@@ -46,12 +52,34 @@ async function retryWithBackoff(fn, opts = {}) {
       }
 
       log.warn(`${name}: attempt ${attempt} failed (${err.message}). Retrying in ${delay}ms...`);
-      await sleep(delay);
+
+      // Interruptible sleep: wakes early if signal fires
+      await sleepInterruptible(delay, signal);
+
+      if (signal()) {
+        log.info(`${name}: abort signal received during backoff, stopping retries`);
+        return;
+      }
 
       // Exponential backoff with jitter, capped at maxMs
       delay = Math.min(maxMs, delay * 2) * (0.8 + Math.random() * 0.4);
     }
   }
+}
+
+/**
+ * Sleep for up to `ms` milliseconds, but wake immediately if `signal()` returns true.
+ * Polls every 200ms — fast enough for teardown, low enough overhead.
+ */
+function sleepInterruptible(ms, signal) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + ms;
+    const check = () => {
+      if (signal() || Date.now() >= deadline) return resolve();
+      setTimeout(check, Math.min(200, deadline - Date.now()));
+    };
+    setTimeout(check, Math.min(200, ms));
+  });
 }
 
 function sleep(ms) {
